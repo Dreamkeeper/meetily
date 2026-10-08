@@ -417,6 +417,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         *global_manager = Some(manager);
     }
 
+    // Follow default-output changes so the system channel survives a BT drop-out.
+    #[cfg(not(target_os = "macos"))]
+    spawn_system_output_follower(app.clone(), session.clone());
+
     // Spawn background device event processor (mic-disconnect fallback).
     if let Some(receiver) = device_event_receiver {
         spawn_device_event_processor(app.clone(), receiver, session);
@@ -605,6 +609,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
         *global_manager = Some(manager);
     }
+
+    // Follow default-output changes so the system channel survives a BT drop-out.
+    #[cfg(not(target_os = "macos"))]
+    spawn_system_output_follower(app.clone(), session.clone());
 
     // Spawn background device event processor (mic-disconnect fallback).
     if let Some(receiver) = device_event_receiver {
@@ -1283,6 +1291,10 @@ static MIC_SWAP_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::
 
 // Bounded retry budget for the disconnect fallback (P1 #2). Counts COMPLETED
 // failed attempts; MIC_SWAP_IN_PROGRESS still prevents overlapping swaps.
+/// Prevents concurrent system-audio (output device) switches.
+#[cfg(not(target_os = "macos"))]
+static SYSTEM_SWAP_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 static MIC_FALLBACK_FAILED_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const MAX_MIC_FALLBACK_ATTEMPTS: u32 = 3;
 
@@ -1452,6 +1464,17 @@ fn spawn_device_event_processor<R: Runtime>(
                             trigger_mic_fallback_to_default(app_clone, name, session).await;
                         });
                     }
+                    // The system audio (loopback) device died too: capture whatever the
+                    // system now plays through, otherwise the rest of the call is lost.
+                    #[cfg(not(target_os = "macos"))]
+                    if matches!(device_type, DeviceMonitorType::SystemAudio) {
+                        let name = device_name.clone();
+                        let app_clone = app.clone();
+                        let session = session.clone();
+                        tokio::spawn(async move {
+                            trigger_system_fallback_to_default(app_clone, name, session).await;
+                        });
+                    }
                 }
                 DeviceEvent::DeviceReconnected { ref device_name, ref device_type } => {
                     // Per product decision: once we have fallen back to the
@@ -1466,6 +1489,169 @@ fn spawn_device_event_processor<R: Runtime>(
         }
         info!("[DEVICE_EVENTS] Background event processor stopped (channel closed)");
     });
+}
+
+/// Current default output device name, resolved off the async runtime
+/// (device enumeration can block).
+#[cfg(not(target_os = "macos"))]
+async fn current_default_output_name() -> Option<String> {
+    tokio::task::spawn_blocking(|| default_output_device().ok().map(|d| d.name))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Follow default-output changes during a recording (Windows/Linux).
+///
+/// Call apps play through the system default output, which changes when a
+/// Bluetooth headset drops out or reconnects, or when the user switches output.
+/// The loopback capture is bound to one device, so without this the system
+/// channel goes silent for the rest of the meeting. Only active when the
+/// recording started on the default output; an explicitly chosen device is
+/// respected. Not enabled on macOS, where mid-recording stream creation is
+/// known to hang (see spawn_device_event_processor).
+#[cfg(not(target_os = "macos"))]
+fn spawn_system_output_follower<R: Runtime>(app: AppHandle<R>, session: Arc<super::RecordingState>) {
+    tokio::spawn(async move {
+        let current = |s: &Arc<super::RecordingState>| s.get_system_device().map(|d| d.name.clone());
+        let start_default = current_default_output_name().await;
+        if current(&session).is_none() || current(&session) != start_default {
+            info!(
+                "[SYSTEM_FOLLOW] System audio device {:?} is not the default output {:?} — not following output changes",
+                current(&session), start_default
+            );
+            return;
+        }
+        info!("[SYSTEM_FOLLOW] Following default output device changes during this recording");
+        // A changed default must be seen on two consecutive polls: BT reconnects flap briefly.
+        let mut pending: Option<(String, u32)> = None;
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            if !session_live(&session) {
+                break;
+            }
+            let (Some(default_name), Some(current_name)) = (current_default_output_name().await, current(&session)) else {
+                pending = None;
+                continue;
+            };
+            if default_name == current_name {
+                pending = None;
+                continue;
+            }
+            let seen = match &pending {
+                Some((name, count)) if *name == default_name => count + 1,
+                _ => 1,
+            };
+            if seen >= 2 {
+                pending = None;
+                perform_system_swap(app.clone(), default_name, &session, "default output changed").await;
+            } else {
+                pending = Some((default_name, seen));
+            }
+        }
+        info!("[SYSTEM_FOLLOW] Stopped (recording ended)");
+    });
+}
+
+/// System audio device disconnected: wait until the OS has moved the default
+/// output away from the dead device, then capture the new default.
+#[cfg(not(target_os = "macos"))]
+async fn trigger_system_fallback_to_default<R: Runtime>(
+    app: AppHandle<R>,
+    disconnected_name: String,
+    session: Arc<super::RecordingState>,
+) {
+    for _ in 0..10 {
+        if !session_live(&session) {
+            return;
+        }
+        match current_default_output_name().await {
+            Some(name) if name != disconnected_name => {
+                perform_system_swap(app, name, &session, "device disconnected").await;
+                return;
+            }
+            _ => tokio::time::sleep(tokio::time::Duration::from_secs(1)).await,
+        }
+    }
+    warn!("[SYSTEM_FALLBACK] Default output still '{}' after 10 s — system audio stays silent", disconnected_name);
+}
+
+/// Switch system audio capture to `device_name` (one retry), announcing the result.
+#[cfg(not(target_os = "macos"))]
+async fn perform_system_swap<R: Runtime>(
+    app: AppHandle<R>,
+    device_name: String,
+    session: &Arc<super::RecordingState>,
+    reason: &str,
+) {
+    if session.get_system_device().map(|d| d.name.clone()).as_deref() == Some(device_name.as_str()) {
+        return;
+    }
+    if SYSTEM_SWAP_IN_PROGRESS.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return;
+    }
+    info!("[SYSTEM_SWAP] Switching system audio to '{}' ({})", device_name, reason);
+    let mut result = do_system_swap(&device_name, session).await;
+    if result.is_err() && session_live(session) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        result = do_system_swap(&device_name, session).await;
+    }
+    match result {
+        Ok(()) => {
+            info!("[SYSTEM_SWAP] System audio now captured from '{}'", device_name);
+            let _ = app.emit("system-device-switched", serde_json::json!({ "device_name": device_name }));
+        }
+        Err(e) => {
+            error!("[SYSTEM_SWAP] Switching system audio to '{}' failed: {}", device_name, e);
+            if session_live(session) {
+                let _ = app.emit("system-swap-failed", serde_json::json!({ "error": e, "device_name": device_name }));
+            }
+        }
+    }
+    SYSTEM_SWAP_IN_PROGRESS.store(false, Ordering::SeqCst);
+}
+
+/// Phased system-audio swap, mirroring do_mic_swap: the manager lock is never
+/// held during stream teardown or creation.
+#[cfg(not(target_os = "macos"))]
+async fn do_system_swap(device_name: &str, session: &Arc<super::RecordingState>) -> Result<(), String> {
+    let old_stream = {
+        let mut guard = RECORDING_MANAGER.lock().unwrap();
+        let manager = guard.as_mut().ok_or_else(|| "Recording manager not available".to_string())?;
+        if !manager.is_recording() {
+            return Err("Recording stopped — aborting system audio switch".to_string());
+        }
+        if !Arc::ptr_eq(manager.get_state(), session) {
+            return Err("Session changed before system audio switch — aborting".to_string());
+        }
+        manager.take_system_stream_for_swap()
+    };
+    if let Some(s) = old_stream {
+        if let Err(e) = s.stop() {
+            warn!("[SYSTEM_SWAP] Failed to stop old system audio stream (proceeding): {}", e);
+        }
+    }
+
+    let device_arc = std::sync::Arc::new(super::AudioDevice::new(
+        device_name.to_string(),
+        super::DeviceType::Output,
+    ));
+    let new_stream = super::stream::AudioStream::create(
+        device_arc.clone(),
+        session.clone(),
+        super::recording_state::DeviceType::System,
+        None,
+    ).await.map_err(|e| format!("Failed to create system audio stream: {}", e))?;
+
+    let mut guard = RECORDING_MANAGER.lock().unwrap();
+    match guard.as_mut() {
+        Some(manager) if Arc::ptr_eq(manager.get_state(), session) => {
+            manager.set_system_stream_after_swap(new_stream, device_arc);
+            Ok(())
+        }
+        Some(_) => Err("Session changed during system audio switch — discarding stream".to_string()),
+        None => Err("Recording manager gone during system audio switch".to_string()),
+    }
 }
 
 /// Disconnect fallback: swap the active mic to the system default input

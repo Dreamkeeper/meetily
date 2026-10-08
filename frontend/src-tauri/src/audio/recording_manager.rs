@@ -598,6 +598,27 @@ impl RecordingManager {
         self.state.set_microphone_device(device);
     }
 
+    /// Take the system audio stream out for an output-device switch (Phase 1).
+    pub fn take_system_stream_for_swap(&mut self) -> Option<super::stream::AudioStream> {
+        self.stream_manager.take_system_stream()
+    }
+
+    /// Install the new system audio stream after an output-device switch (Phase 3)
+    /// and point the device monitor at the new output device.
+    pub fn set_system_stream_after_swap(
+        &mut self,
+        stream: super::stream::AudioStream,
+        device: Arc<AudioDevice>,
+    ) {
+        self.stream_manager.set_system_stream(stream);
+        if let (Some(ref monitor), Some(mic)) = (&self.device_monitor, self.state.get_microphone_device()) {
+            // The mailbox updates both tracked names; re-sending the current mic
+            // name only resets its missing-counter.
+            monitor.notify_mic_swapped(mic.name.clone(), Some(device.name.clone()));
+        }
+        self.state.set_system_device(device);
+    }
+
     /// Get reference to recording state for external access
     pub fn get_state(&self) -> &Arc<RecordingState> {
         &self.state
