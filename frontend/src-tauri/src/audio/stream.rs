@@ -468,6 +468,17 @@ impl AudioStreamManager {
         self.microphone_stream = Some(stream);
     }
 
+    /// Take the system audio stream OUT of the manager, keeping the microphone
+    /// running. As with the mic, the caller stops/drops it outside any lock.
+    pub fn take_system_stream(&mut self) -> Option<AudioStream> {
+        self.system_stream.take()
+    }
+
+    /// Set a new system audio stream (used after an output-device switch).
+    pub fn set_system_stream(&mut self, stream: AudioStream) {
+        self.system_stream = Some(stream);
+    }
+
     /// Get stream count
     pub fn active_stream_count(&self) -> usize {
         let mut count = 0;
