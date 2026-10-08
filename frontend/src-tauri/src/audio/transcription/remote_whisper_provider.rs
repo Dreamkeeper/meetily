@@ -75,6 +75,25 @@ impl RemoteWhisperProvider {
         Ok(json.get("text").and_then(|t| t.as_str()).unwrap_or("").trim().to_string())
     }
 
+    /// Quick reachability check (GET /health), used when a recording starts.
+    pub async fn health(base_url: &str) -> Result<(), String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .no_proxy()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let response = client
+            .get(format!("{}/health", base_url.trim_end_matches('/')))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("HTTP {}", response.status()))
+        }
+    }
+
     /// Ask the server to load its model before the first segment arrives.
     pub async fn warmup(base_url: &str) -> Result<(), String> {
         let client = reqwest::Client::builder()
