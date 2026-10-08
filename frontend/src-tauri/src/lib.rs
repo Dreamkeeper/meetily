@@ -566,7 +566,19 @@ pub fn run() {
                 !cwd.is_empty()
             );
 
-            tray::focus_main_window(app);
+            // `--start-recording [--meeting-name=<title>]` starts a recording in the
+            // running instance (used by external reminders); otherwise just focus.
+            if args.iter().any(|a| a == "--start-recording") {
+                let meeting_name = args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("--meeting-name="))
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty());
+                log_info!("External start-recording request; meeting_name_present={}", meeting_name.is_some());
+                tray::request_start_recording(app, meeting_name);
+            } else {
+                tray::focus_main_window(app);
+            }
         }));
     }
 
