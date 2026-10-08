@@ -19,6 +19,12 @@ const PROVIDER_COMMANDS: Record<string, ProviderCommands> = {
     hasAvailableModels: 'parakeet_has_available_models',
     getAvailableModels: 'parakeet_get_available_models',
   },
+  // Remote Whisper runs on a server; the local Parakeet model is its offline fallback
+  remoteWhisper: {
+    initialize: 'parakeet_init',
+    hasAvailableModels: 'parakeet_has_available_models',
+    getAvailableModels: 'parakeet_get_available_models',
+  },
 };
 
 export function getProviderCommands(provider: string): ProviderCommands | null {

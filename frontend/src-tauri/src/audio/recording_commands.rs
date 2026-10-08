@@ -848,7 +848,8 @@ pub async fn stop_recording<R: Runtime>(
     };
 
     match config.as_deref() {
-        Some("parakeet") => {
+        // Remote Whisper keeps a local Parakeet model loaded as its fallback
+        Some("parakeet") | Some("remoteWhisper") => {
             info!("🦜 Unloading Parakeet model...");
             let engine_clone = {
                 let engine_guard = crate::parakeet_engine::commands::PARAKEET_ENGINE
