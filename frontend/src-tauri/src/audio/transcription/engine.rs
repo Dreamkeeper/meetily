@@ -135,6 +135,36 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 }
             }
         }
+        "remoteWhisper" => {
+            // The server does the work; the local Parakeet model is the fallback when it's
+            // unreachable, so recording can start if either is available.
+            let url = remote_whisper_url(&config.model);
+            info!("🔍 Checking Remote Whisper server at {} (fallback: local Parakeet)", url);
+            let fallback_ready = match crate::parakeet_engine::commands::parakeet_init().await {
+                Ok(()) => crate::parakeet_engine::commands::parakeet_validate_model_ready_with_config(app)
+                    .await
+                    .map_err(|e| warn!("⚠️ Parakeet fallback not available: {}", e))
+                    .is_ok(),
+                Err(e) => {
+                    warn!("⚠️ Parakeet fallback not available: {}", e);
+                    false
+                }
+            };
+            match super::remote_whisper_provider::RemoteWhisperProvider::warmup(&url).await {
+                Ok(()) => {
+                    info!("✅ Remote Whisper server ready at {}", url);
+                    Ok(())
+                }
+                Err(e) if fallback_ready => {
+                    warn!("⚠️ Remote Whisper server unreachable ({}), recording will use local Parakeet until it responds", e);
+                    Ok(())
+                }
+                Err(e) => Err(format!(
+                    "Remote Whisper server at {} is unreachable ({}) and no local Parakeet model is available as fallback.",
+                    url, e
+                )),
+            }
+        }
         other => {
             warn!("❌ Unsupported transcription provider for local recording: {}", other);
             Err(format!(
@@ -212,11 +242,36 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 }
             }
         }
+        "remoteWhisper" => {
+            let url = remote_whisper_url(&config.model);
+            let fallback = {
+                let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE.lock().unwrap();
+                guard.as_ref().cloned()
+            };
+            let fallback = match fallback {
+                Some(engine) if engine.is_model_loaded().await => Some(engine),
+                _ => None,
+            };
+            info!("🌐 Initializing Remote Whisper engine ({}), Parakeet fallback: {}", url, fallback.is_some());
+            Ok(TranscriptionEngine::Provider(Arc::new(
+                super::remote_whisper_provider::RemoteWhisperProvider::new(url, fallback),
+            )))
+        }
         "localWhisper" | _ => {
             info!("🎤 Initializing Whisper transcription engine");
             let whisper_engine = get_or_init_whisper(app).await?;
             Ok(TranscriptionEngine::Whisper(whisper_engine))
         }
+    }
+}
+
+/// Server URL for the Remote Whisper provider (stored in the transcript config's model field).
+fn remote_whisper_url(model: &str) -> String {
+    let url = model.trim();
+    if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        super::remote_whisper_provider::DEFAULT_REMOTE_WHISPER_URL.to_string()
     }
 }
 

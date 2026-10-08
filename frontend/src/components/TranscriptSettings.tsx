@@ -10,7 +10,7 @@ import { ParakeetModelManager } from './ParakeetModelManager';
 
 
 export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
+    provider: 'localWhisper' | 'parakeet' | 'remoteWhisper' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
     model: string;
     apiKey?: string | null;
 }
@@ -27,6 +27,11 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [isApiKeyLocked, setIsApiKeyLocked] = useState<boolean>(true);
     const [isLockButtonVibrating, setIsLockButtonVibrating] = useState<boolean>(false);
     const [uiProvider, setUiProvider] = useState<TranscriptModelProps['provider']>(transcriptModelConfig.provider);
+    const DEFAULT_REMOTE_URL = 'http://127.0.0.1:18765';
+    const [remoteUrl, setRemoteUrl] = useState<string>(
+        transcriptModelConfig.provider === 'remoteWhisper' && transcriptModelConfig.model ? transcriptModelConfig.model : DEFAULT_REMOTE_URL
+    );
+    const isLocalProvider = (p: string) => p === 'localWhisper' || p === 'parakeet' || p === 'remoteWhisper';
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
@@ -34,7 +39,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     }, [transcriptModelConfig.provider]);
 
     useEffect(() => {
-        if (transcriptModelConfig.provider === 'localWhisper' || transcriptModelConfig.provider === 'parakeet') {
+        if (isLocalProvider(transcriptModelConfig.provider)) {
             setApiKey(null);
         }
     }, [transcriptModelConfig.provider]);
@@ -53,6 +58,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const modelOptions = {
         localWhisper: [], // Model selection handled by ModelManager component
         parakeet: [], // Model selection handled by ParakeetModelManager component
+        remoteWhisper: [], // Server URL entered below
         deepgram: ['nova-2-phonecall'],
         elevenLabs: ['eleven_multilingual_v2'],
         groq: ['llama-3.3-70b-versatile'],
@@ -112,7 +118,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 onValueChange={(value) => {
                                     const provider = value as TranscriptModelProps['provider'];
                                     setUiProvider(provider);
-                                    if (provider !== 'localWhisper' && provider !== 'parakeet') {
+                                    if (!isLocalProvider(provider)) {
                                         fetchApiKey(provider);
                                     }
                                 }}
@@ -123,6 +129,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 <SelectContent>
                                     <SelectItem value="parakeet">⚡ Parakeet (Recommended - Real-time / Accurate)</SelectItem>
                                     <SelectItem value="localWhisper">🏠 Local Whisper (High Accuracy)</SelectItem>
+                                    <SelectItem value="remoteWhisper">🖥️ Remote Whisper (GPU server, Parakeet fallback)</SelectItem>
                                     {/* <SelectItem value="deepgram">☁️ Deepgram (Backup)</SelectItem>
                                     <SelectItem value="elevenLabs">☁️ ElevenLabs</SelectItem>
                                     <SelectItem value="groq">☁️ Groq</SelectItem>
@@ -130,7 +137,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 </SelectContent>
                             </Select>
 
-                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && (
+                            {!isLocalProvider(uiProvider) && (
                                 <Select
                                     value={transcriptModelConfig.model}
                                     onValueChange={(value) => {
@@ -159,6 +166,39 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 onModelSelect={handleWhisperModelSelect}
                                 autoSave={true}
                             />
+                        </div>
+                    )}
+
+                    {uiProvider === 'remoteWhisper' && (
+                        <div className="mt-6 space-y-2">
+                            <Label className="block text-sm font-medium text-gray-700">Whisper server URL</Label>
+                            <div className="flex space-x-2 mx-1">
+                                <Input
+                                    value={remoteUrl}
+                                    onChange={(e) => setRemoteUrl(e.target.value)}
+                                    placeholder={DEFAULT_REMOTE_URL}
+                                />
+                                <Button
+                                    type="button"
+                                    onClick={() => {
+                                        setTranscriptModelConfig({
+                                            ...transcriptModelConfig,
+                                            provider: 'remoteWhisper',
+                                            model: remoteUrl.trim() || DEFAULT_REMOTE_URL,
+                                        });
+                                        if (onModelSelect) {
+                                            onModelSelect();
+                                        }
+                                    }}
+                                >
+                                    Use
+                                </Button>
+                            </div>
+                            <p className="text-xs text-gray-500 mx-1">
+                                Each speech segment is transcribed by a Whisper server (POST /v1/live/transcribe), e.g. a GPU
+                                machine reached through an SSH tunnel. If it is unreachable, the local Parakeet model is used,
+                                so keep a Parakeet model downloaded.
+                            </p>
                         </div>
                     )}
 
