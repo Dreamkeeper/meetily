@@ -6,12 +6,14 @@
 //
 // Server contract: POST {base_url}/v1/live/transcribe?language=<auto|auto-translate|code>
 // with the body as raw little-endian f32 samples (16 kHz mono); the response is
-// JSON with a "text" field.
+// JSON with a "text" field. GET {base_url}/v1/live/status returns {"ready": bool}; while the
+// server is still loading its model, segments wait (queue up) instead of falling back, so the
+// live transcript just starts later and then catches up.
 
 use super::provider::{TranscriptionError, TranscriptionProvider, TranscriptResult};
 use async_trait::async_trait;
 use log::{info, warn};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +24,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// every segment.
 const FAILURES_BEFORE_FALLBACK: u32 = 2;
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// How long a segment may wait for the server to finish loading its model (a cold load takes ~60 s).
+const READY_WAIT: Duration = Duration::from_secs(180);
+const READY_POLL: Duration = Duration::from_secs(2);
 
 pub struct RemoteWhisperProvider {
     client: reqwest::Client,
@@ -29,6 +34,7 @@ pub struct RemoteWhisperProvider {
     fallback: Option<Arc<crate::parakeet_engine::ParakeetEngine>>,
     consecutive_failures: AtomicU32,
     last_attempt: Mutex<Option<Instant>>,
+    server_ready: AtomicBool,
 }
 
 impl RemoteWhisperProvider {
@@ -44,6 +50,7 @@ impl RemoteWhisperProvider {
             fallback,
             consecutive_failures: AtomicU32::new(0),
             last_attempt: Mutex::new(None),
+            server_ready: AtomicBool::new(false),
         }
     }
 
@@ -53,6 +60,47 @@ impl RemoteWhisperProvider {
         }
         let last = *self.last_attempt.lock().unwrap();
         last.map_or(true, |t| t.elapsed() >= RETRY_AFTER)
+    }
+
+    /// Wait until the server reports its model loaded. Errors only when the server is unreachable
+    /// or not ready within READY_WAIT; "still loading" is waited out.
+    async fn wait_until_ready(&self) -> Result<(), String> {
+        if self.server_ready.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let mut warmup_sent = false;
+        loop {
+            let status: serde_json::Value = self
+                .client
+                .get(format!("{}/v1/live/status", self.base_url))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .json()
+                .await
+                .map_err(|e| e.to_string())?;
+            if status.get("ready").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if started.elapsed() > READY_POLL {
+                    info!("[REMOTE_WHISPER] Server model ready after {:.0}s — sending queued segments", started.elapsed().as_secs_f32());
+                }
+                self.server_ready.store(true, Ordering::SeqCst);
+                return Ok(());
+            }
+            let loading = status.get("loading").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !loading && !warmup_sent {
+                warmup_sent = true;
+                let url = self.base_url.clone();
+                tokio::spawn(async move {
+                    let _ = RemoteWhisperProvider::warmup(&url).await;
+                });
+            }
+            if started.elapsed() >= READY_WAIT {
+                return Err(format!("server model not ready after {}s", READY_WAIT.as_secs()));
+            }
+            tokio::time::sleep(READY_POLL).await;
+        }
     }
 
     async fn remote_transcribe(&self, audio: &[f32], language: &str) -> Result<String, String> {
@@ -124,7 +172,11 @@ impl TranscriptionProvider for RemoteWhisperProvider {
         if self.should_try_remote() {
             *self.last_attempt.lock().unwrap() = Some(Instant::now());
             let lang = language.as_deref().unwrap_or("auto");
-            match self.remote_transcribe(&audio, lang).await {
+            let result = match self.wait_until_ready().await {
+                Ok(()) => self.remote_transcribe(&audio, lang).await,
+                Err(e) => Err(e),
+            };
+            match result {
                 Ok(text) => {
                     if self.consecutive_failures.swap(0, Ordering::SeqCst) >= FAILURES_BEFORE_FALLBACK {
                         info!("[REMOTE_WHISPER] Server reachable again — back to remote transcription");
@@ -132,6 +184,8 @@ impl TranscriptionProvider for RemoteWhisperProvider {
                     return Ok(TranscriptResult { text, confidence: None, is_partial: false });
                 }
                 Err(e) => {
+                    // the server may have restarted or unloaded its model; re-check readiness next time
+                    self.server_ready.store(false, Ordering::SeqCst);
                     let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
                     warn!("[REMOTE_WHISPER] Segment failed on server ({} in a row): {}", failures, e);
                     if self.fallback.is_none() {
