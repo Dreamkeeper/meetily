@@ -150,9 +150,19 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                     false
                 }
             };
-            match super::remote_whisper_provider::RemoteWhisperProvider::warmup(&url).await {
+            // Only a quick reachability check here: loading the model on the server can take a
+            // minute, so warm-up runs in the background and never delays the recording start
+            // (segments that arrive before the server is ready go to the Parakeet fallback).
+            match super::remote_whisper_provider::RemoteWhisperProvider::health(&url).await {
                 Ok(()) => {
-                    info!("✅ Remote Whisper server ready at {}", url);
+                    info!("✅ Remote Whisper server reachable at {}", url);
+                    let warm_url = url.clone();
+                    tokio::spawn(async move {
+                        match super::remote_whisper_provider::RemoteWhisperProvider::warmup(&warm_url).await {
+                            Ok(()) => info!("✅ Remote Whisper model warm at {}", warm_url),
+                            Err(e) => warn!("⚠️ Remote Whisper warm-up failed: {}", e),
+                        }
+                    });
                     Ok(())
                 }
                 Err(e) if fallback_ready => {
