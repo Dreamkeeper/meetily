@@ -420,6 +420,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Follow default-output changes so the system channel survives a BT drop-out.
     #[cfg(not(target_os = "macos"))]
     spawn_system_output_follower(app.clone(), session.clone());
+    // ...and bring the microphone back to the headset when it reconnects.
+    #[cfg(target_os = "windows")]
+    spawn_mic_return_follower(app.clone(), session.clone());
 
     // Spawn background device event processor (mic-disconnect fallback).
     if let Some(receiver) = device_event_receiver {
@@ -613,6 +616,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Follow default-output changes so the system channel survives a BT drop-out.
     #[cfg(not(target_os = "macos"))]
     spawn_system_output_follower(app.clone(), session.clone());
+    // ...and bring the microphone back to the headset when it reconnects.
+    #[cfg(target_os = "windows")]
+    spawn_mic_return_follower(app.clone(), session.clone());
 
     // Spawn background device event processor (mic-disconnect fallback).
     if let Some(receiver) = device_event_receiver {
@@ -1478,8 +1484,9 @@ fn spawn_device_event_processor<R: Runtime>(
                 }
                 DeviceEvent::DeviceReconnected { ref device_name, ref device_type } => {
                     // Per product decision: once we have fallen back to the
-                    // built-in mic we stay there for the rest of the meeting.
-                    // This is intentional — just log and do nothing.
+                    // built-in mic we stay there for the rest of the meeting
+                    // (except on Windows, where spawn_mic_return_follower
+                    // switches back to the original device once it is present).
                     info!("[DEVICE_EVENTS] Device reconnected: '{}' ({:?}) — staying on current mic (fallback is sticky)", device_name, device_type);
                 }
                 DeviceEvent::DeviceListChanged => {
@@ -1551,6 +1558,67 @@ fn spawn_system_output_follower<R: Runtime>(app: AppHandle<R>, session: Arc<supe
         }
         info!("[SYSTEM_FOLLOW] Stopped (recording ended)");
     });
+}
+
+/// Return the microphone to the device the recording started with once it is
+/// back (Windows).
+///
+/// The disconnect fallback is deliberately sticky upstream because creating a
+/// stream for a freshly reconnected Bluetooth device hangs on macOS. On Windows
+/// that leaves the rest of the call recorded through a laptop or webcam mic
+/// after a brief headset drop-out, so switch back once the original device has
+/// been present for a few polls (BT reconnects re-enumerate several times).
+#[cfg(target_os = "windows")]
+fn spawn_mic_return_follower<R: Runtime>(app: AppHandle<R>, session: Arc<super::RecordingState>) {
+    const PRESENT_POLLS: u32 = 3; // ~6 s at 2 s per poll
+    const MAX_FAILURES: u32 = 3;
+    tokio::spawn(async move {
+        let Some(original) = session.get_microphone_device().map(|d| d.name.clone()) else {
+            return;
+        };
+        let (mut present, mut failures) = (0u32, 0u32);
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            if !session_live(&session) || failures >= MAX_FAILURES {
+                break;
+            }
+            let current = session.get_microphone_device().map(|d| d.name.clone());
+            if current.is_none() || current.as_deref() == Some(original.as_str()) {
+                present = 0;
+                continue;
+            }
+            let name = original.clone();
+            let available = tokio::task::spawn_blocking(move || input_device_present(&name))
+                .await
+                .unwrap_or(false);
+            present = if available { present + 1 } else { 0 };
+            if present < PRESENT_POLLS {
+                continue;
+            }
+            present = 0;
+            if MIC_SWAP_IN_PROGRESS.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                continue;
+            }
+            info!("[MIC_RETURN] '{}' is back — switching the microphone back from {:?}", original, current);
+            let result = perform_mic_hot_swap_task(original.clone(), &session, app.clone()).await;
+            MIC_SWAP_IN_PROGRESS.store(false, Ordering::SeqCst);
+            if let Err(e) = result {
+                failures += 1;
+                warn!("[MIC_RETURN] Switching back to '{}' failed ({}/{}): {}", original, failures, MAX_FAILURES, e);
+            }
+        }
+    });
+}
+
+/// Whether an input device with this exact name is currently present (WASAPI).
+#[cfg(target_os = "windows")]
+fn input_device_present(name: &str) -> bool {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    cpal::host_from_id(cpal::HostId::Wasapi)
+        .ok()
+        .and_then(|host| host.input_devices().ok())
+        .map(|mut devices| devices.any(|d| d.name().map(|n| n == name).unwrap_or(false)))
+        .unwrap_or(false)
 }
 
 /// System audio device disconnected: wait until the OS has moved the default
