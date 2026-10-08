@@ -180,11 +180,24 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 />
                                 <Button
                                     type="button"
-                                    onClick={() => {
+                                    onClick={async () => {
+                                        const url = remoteUrl.trim() || DEFAULT_REMOTE_URL;
+                                        // Persist like the Whisper/Parakeet model managers do; setting
+                                        // the context alone is lost on the next load.
+                                        try {
+                                            await invoke('api_save_transcript_config', {
+                                                provider: 'remoteWhisper',
+                                                model: url,
+                                                apiKey: null,
+                                            });
+                                        } catch (error) {
+                                            console.error('Failed to save Remote Whisper config:', error);
+                                            return;
+                                        }
                                         setTranscriptModelConfig({
                                             ...transcriptModelConfig,
                                             provider: 'remoteWhisper',
-                                            model: remoteUrl.trim() || DEFAULT_REMOTE_URL,
+                                            model: url,
                                         });
                                         if (onModelSelect) {
                                             onModelSelect();
