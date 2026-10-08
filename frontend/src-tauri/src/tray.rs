@@ -391,6 +391,35 @@ fn build_menu<R: Runtime>(
         .build()
 }
 
+/// Start a recording on request from outside the app (a second launch with
+/// `--start-recording [--meeting-name=<title>]`, e.g. from a calendar reminder).
+/// Uses the same path as the tray's "Start Recording": the frontend picks the
+/// selected devices and starts; the optional title replaces the generated one.
+pub(crate) fn request_start_recording<R: Runtime>(app: &AppHandle<R>, meeting_name: Option<String>) {
+    focus_main_window(app);
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if crate::is_recording().await {
+            log::info!("External start request ignored: already recording");
+            return;
+        }
+        set_tray_state(&app_clone, RecordingState::Starting);
+        if let Some(window) = app_clone.get_webview_window("main") {
+            let name_js = meeting_name
+                .as_deref()
+                .map(|n| serde_json::to_string(n).unwrap_or_else(|_| "null".into()))
+                .unwrap_or_else(|| "null".into());
+            let script = format!(
+                "sessionStorage.setItem('autoStartRecording', 'true'); \
+                 if ({name}) {{ sessionStorage.setItem('autoStartMeetingName', {name}); }} \
+                 window.location.assign('/')",
+                name = name_js
+            );
+            let _ = window.eval(&script);
+        }
+    });
+}
+
 pub(crate) fn focus_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         if let Err(e) = window.unminimize() {

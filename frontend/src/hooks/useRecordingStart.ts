@@ -242,8 +242,11 @@ export function useRecordingStart(
 
           // Start the actual backend recording
           try {
-            // Generate meeting title
-            const generatedMeetingTitle = generateMeetingTitle();
+            // Use a title passed with an external start request (e.g. the calendar
+            // event name), otherwise generate one
+            const requestedTitle = sessionStorage.getItem('autoStartMeetingName');
+            sessionStorage.removeItem('autoStartMeetingName');
+            const generatedMeetingTitle = requestedTitle?.trim() || generateMeetingTitle();
 
             // Set STARTING status before initiating backend recording
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');
